@@ -197,14 +197,17 @@ try {
     Write-Verbose ("Plan: {0} change(s), {1} already in the desired state." -f $actionable.Count, (@($plan).Count - $actionable.Count))
 
     if ($DiffOnly) {
-        Write-Verbose '-DiffOnly was specified. Nothing was changed.'
+        Write-Warning ("-DiffOnly was specified, so NOTHING was changed. The plan below lists " +
+            "{0} pending change(s). Re-run without -DiffOnly to apply it." -f $actionable.Count)
         return $plan
     }
 
     if ($actionable.Count -eq 0) {
-        Write-Verbose 'Everything already matches the desired state. Nothing to do.'
+        Write-Warning 'Everything already matches the desired state. Nothing to do.'
         return $plan
     }
+
+    Write-Verbose ("Applying {0} change(s)." -f $actionable.Count)
     $totalResources = ($actionable | Measure-Object -Property ResourceCount -Sum).Sum
     Write-Verbose ("About to {0} {1} deployment(s) covering roughly {2} resource(s)." -f $Action, $actionable.Count, $totalResources)
 

@@ -227,14 +227,17 @@ try {
     Write-Verbose ("Plan: {0} change(s), {1} already in the desired state." -f $actionable.Count, (@($plan).Count - $actionable.Count))
 
     if ($DiffOnly) {
-        Write-Verbose '-DiffOnly was specified. Nothing was changed.'
+        Write-Warning ("-DiffOnly was specified, so NOTHING was changed. The plan below lists " +
+            "{0} pending change(s). Re-run without -DiffOnly to apply it." -f $actionable.Count)
         return $plan
     }
 
     if ($actionable.Count -eq 0) {
-        Write-Verbose 'Everything already matches the desired state. Nothing to do.'
+        Write-Warning 'Everything already matches the desired state. Nothing to do.'
         return $plan
     }
+
+    Write-Verbose ("Applying {0} change(s)." -f $actionable.Count)
     foreach ($item in ($actionable | Where-Object Kind -eq 'Role')) {
         $privileges = @($item.Desired.Privileges -split '\s*;\s*' | Where-Object { $_ })
         $resolved = @(Get-VIPrivilege -Id $privileges -ErrorAction SilentlyContinue)
@@ -256,22 +259,67 @@ try {
         }
     }
 
+    function Resolve-PermissionEntity {
+        <#
+            Finds the inventory object a permission belongs on. Networks and datastores are
+            not reachable through Get-Inventory, and a folder and a VM can share a name, so
+            the entity type recorded in the export is used to search and to disambiguate.
+        #>
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)][string]$Name,
+            [Parameter()][string]$EntityType
+        )
+
+        $candidates = @()
+
+        switch -Regex ($EntityType) {
+            'Network|Portgroup' { $candidates = @(Get-VirtualNetwork -Name $Name -ErrorAction SilentlyContinue) }
+            'Datastore'         { $candidates = @(Get-Datastore -Name $Name -ErrorAction SilentlyContinue) }
+        }
+
+        if (-not $candidates) { $candidates = @(Get-Inventory -Name $Name -ErrorAction SilentlyContinue) }
+        if (-not $candidates) { $candidates = @(Get-Datastore -Name $Name -ErrorAction SilentlyContinue) }
+        if (-not $candidates) { $candidates = @(Get-VirtualNetwork -Name $Name -ErrorAction SilentlyContinue) }
+
+        if ($EntityType -and @($candidates).Count -gt 1) {
+            $typed = @($candidates | Where-Object { ($_.GetType().Name -replace 'Impl$', '') -eq $EntityType })
+            if ($typed) { $candidates = $typed }
+        }
+
+        return @($candidates)
+    }
+
     foreach ($item in ($actionable | Where-Object Kind -eq 'Permission')) {
         $row = $item.Desired
-        $entity = Get-Inventory -Name $row.Entity -ErrorAction SilentlyContinue
-        if (-not $entity) { $entity = Get-Datastore -Name $row.Entity -ErrorAction SilentlyContinue }
+        $candidates = Resolve-PermissionEntity -Name $row.Entity -EntityType $row.EntityType
 
-        if (-not $entity) {
-            Write-Warning "Object '$($row.Entity)' does not exist in this vCenter. Skipping its permission."
+        if (@($candidates).Count -eq 0) {
+            Write-Warning ("Object '{0}' of type '{1}' does not exist in this vCenter. Skipping its permission." -f $row.Entity, $row.EntityType)
             [pscustomobject]@{ Kind = 'Permission'; Name = $item.Key; Status = 'SkippedMissingObject' }
             continue
+        }
+
+        if (@($candidates).Count -gt 1) {
+            Write-Warning ("'{0}' matches {1} objects here and the type '{2}' does not narrow it to one. Skipping rather than granting on the wrong object." -f `
+                $row.Entity, @($candidates).Count, $row.EntityType)
+            [pscustomobject]@{ Kind = 'Permission'; Name = $item.Key; Status = 'SkippedAmbiguousObject' }
+            continue
+        }
+
+        $entity = @($candidates)[0]
+
+        $propagate = $true
+        if ($null -ne $row.Propagate -and "$($row.Propagate)" -ne '') {
+            try { $propagate = [System.Convert]::ToBoolean([string]$row.Propagate) }
+            catch { $propagate = $true }
         }
 
         if (-not $PSCmdlet.ShouldProcess("$($row.Principal) on $($row.Entity)", "Grant role $($row.Role)")) { continue }
 
         try {
             New-VIPermission -Entity $entity -Principal $row.Principal -Role $row.Role `
-                -Propagate ([bool]$row.Propagate) -Confirm:$false -ErrorAction Stop | Out-Null
+                -Propagate $propagate -Confirm:$false -ErrorAction Stop | Out-Null
             [pscustomobject]@{ Kind = 'Permission'; Name = $item.Key; Status = 'Granted' }
         }
         catch {
