@@ -85,22 +85,63 @@ between the two halves of a round trip.
 7. Never delete as a side effect of a sync. Removing things is its own script with its own
    explicit parameter.
 
+## Connection scoping
+
+Any script that opens its own connection **must** pin every call to it:
+
+```powershell
+$connection = Connect-VIServer -Server $Server -Credential $Credential -ErrorAction Stop
+
+$PSDefaultParameterValues = $PSDefaultParameterValues.Clone()
+$PSDefaultParameterValues['*:Server'] = $connection
+```
+
+This is not optional and it is not cosmetic. PowerCLI cmdlets act on *every*
+connected server. With two vCenters connected, `Get-VM` returns both inventories
+merged with no indication which is which, and `Get-VIPrivilege` returns every
+privilege twice - which is how a role import once failed with
+*"The specified privileges are from a different server"* after reporting
+`170 of 85 privileges resolved`.
+
+Two details matter:
+
+- **Clone first.** `$PSDefaultParameterValues['x'] = $y` mutates the hashtable
+  inherited from the caller, so the setting would outlive the script and change
+  the behaviour of everything the operator runs afterwards. Assigning a clone
+  keeps it script-scoped.
+- **One wildcard key only.** If `*:Server` and `Get-Something:Server` are both
+  set, PowerShell warns and ignores *both*. Where a call needs a different
+  connection - `Get-CisService` wants the CIS one, not the vSphere one - pass
+  `-Server` explicitly at the call site, which always wins over a default.
+
+## Validate in the plan, not in the apply
+
+Anything that can make a change fail should be checked while `$plan` is being
+built, so `-DiffOnly` surfaces it. A check that only runs during apply gives a
+clean dry run followed by a failed real one, which is worse than no dry run.
+
+The role import learned this the hard way: it verified that privileges existed
+only as it created each role, so `-DiffOnly` looked perfect and the real run
+died on the first role.
+
 ## Before opening a pull request
 
 ```powershell
 Install-Module PSScriptAnalyzer -Scope CurrentUser
 
-# Must be clean.
-Invoke-ScriptAnalyzer -Path ./products -Recurse -Severity Error,Warning
+# One command. This is exactly what CI runs.
+./tools/Invoke-RepositoryCheck.ps1
+```
 
-# Must report zero failures.
-Get-ChildItem ./products -Recurse -Filter *.ps1 | ForEach-Object {
-    $errors = $null
-    [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errors) | Out-Null
-    if ($errors) { "{0}: {1}" -f $_.Name, $errors[0].Message }
-}
+It checks parsing, analyzer findings, PowerShell 7 syntax in scripts declaring
+5.1, comment-based help, authorship, `ShouldProcess` and `-DiffOnly` on write
+scripts, connection scoping, standalone-ness, README cross-references, and
+attribution markers. Every one of those rules exists because something went
+wrong once; adding a rule when you fix a new class of bug is the point.
 
-# Must render.
+Also confirm your help renders:
+
+```powershell
 Get-Help ./products/<product>/<version>/<YourScript>.ps1 -Full
 ```
 

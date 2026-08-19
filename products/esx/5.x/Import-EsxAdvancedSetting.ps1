@@ -184,6 +184,12 @@ try {
             "every connected server unless they are scoped, which silently mixes inventories. " +
             "This script scopes its own calls to '{1}'.") -f @($DefaultVIServers).Count, $connection.Name)
     }
+    # Scope every call in this script to the connection opened above. Without this,
+    # PowerCLI cmdlets act on every connected server, which silently mixes inventories
+    # when more than one is connected. The hashtable is cloned first because indexing
+    # the inherited one would change the caller's session defaults too.
+    $PSDefaultParameterValues = $PSDefaultParameterValues.Clone()
+    $PSDefaultParameterValues['*:Server'] = $connection
 
     if (-not $Name -and -not $AllSettings) {
         throw 'Refusing to apply every advanced setting implicitly. Pass -Name with the settings you mean, or -AllSettings.'

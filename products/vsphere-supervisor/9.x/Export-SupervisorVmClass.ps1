@@ -134,11 +134,17 @@ try {
             "This script scopes its own calls to '{1}'.") -f @($DefaultVIServers).Count, $connection.Name)
     }
     Write-Verbose "Connected to vCenter Server $($connection.Name) and its Automation API endpoint"
+    # Scope every call in this script to the connection opened above. Without this,
+    # PowerCLI cmdlets act on every connected server, which silently mixes inventories
+    # when more than one is connected. The hashtable is cloned first because indexing
+    # the inherited one would change the caller's session defaults too.
+    $PSDefaultParameterValues = $PSDefaultParameterValues.Clone()
+    $PSDefaultParameterValues['*:Server'] = $connection
 
     $records = @()
 
-    $classService = Get-CisService -Name 'com.vmware.vcenter.namespace_management.virtual_machine_classes' -ErrorAction Stop
-    $namespaceService = Get-CisService -Name 'com.vmware.vcenter.namespaces.instances' -ErrorAction Stop
+    $classService = Get-CisService -Name 'com.vmware.vcenter.namespace_management.virtual_machine_classes' -Server $cisConnection -ErrorAction Stop
+    $namespaceService = Get-CisService -Name 'com.vmware.vcenter.namespaces.instances' -Server $cisConnection -ErrorAction Stop
 
     $namespacesByClass = @{}
     foreach ($entry in @($namespaceService.list())) {
