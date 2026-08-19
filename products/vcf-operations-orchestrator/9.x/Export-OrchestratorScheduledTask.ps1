@@ -1,0 +1,185 @@
+<#
+.SYNOPSIS
+    Lists scheduled workflow tasks with their recurrence, next run and the state of the last one.
+
+.DESCRIPTION
+    Returns each scheduled task with the workflow it runs, its recurrence pattern, next
+    scheduled run, current state and the outcome of its most recent execution.
+
+    A suspended scheduled task looks identical to an active one until you read the state column,
+    and a task that has been failing every night for a month is only visible here.
+
+    Pain area addressed: #13 Alarm noise and audit-trail extraction.
+
+.PARAMETER Server
+    FQDN or IP address of the VCF Operations orchestrator appliance.
+
+.PARAMETER Credential
+    Credential used to authenticate to the orchestrator API.
+
+.PARAMETER SuspendedOnly
+    Return only tasks that are not currently active.
+
+.PARAMETER IgnoreInvalidCertificate
+    Accept an untrusted or self-signed certificate on the target endpoint. Use only in lab
+    environments.
+
+.PARAMETER OutputPath
+    Path of the file to write. When omitted the records are only returned on the pipeline and
+    nothing is written to disk.
+
+.PARAMETER Format
+    Output file format. CSV is the flat table, JSON carries the export envelope that the
+    matching import script validates, HTML is a styled table for sharing.
+
+.EXAMPLE
+    PS> ./Export-OrchestratorScheduledTask.ps1 -Server vro.example.local -Credential $cred
+
+    Lists every scheduled task and its state.
+
+.NOTES
+    Author        : Sampath
+    Product       : VCF Operations orchestrator (VCF 9.x)
+    Target        : VMware Cloud Foundation 9.x
+    Modules       : None (uses Invoke-RestMethod)
+    Behaviour     : Read-only. Collects data and optionally writes it to disk.
+    Standalone    : Yes. This script does not dot-source or import any other file
+                    in this repository and can be copied out on its own.
+#>
+
+#Requires -Version 5.1
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)] [ValidateNotNullOrEmpty()] [string]$Server,
+    [Parameter(Mandatory)] [System.Management.Automation.PSCredential]$Credential,
+    [Parameter()] [switch]$SuspendedOnly,
+    [Parameter()] [switch]$IgnoreInvalidCertificate,
+    [Parameter()] [string]$OutputPath,
+    [Parameter()] [ValidateSet('CSV','JSON','HTML')] [string]$Format = 'CSV'
+)
+
+$ErrorActionPreference = 'Stop'
+
+function Out-ResultFile {
+    <#
+        Writes the collected records to disk in the requested format. JSON uses the
+        repository's export envelope so a matching Import-*/Invoke-* script can
+        validate what it has been handed before changing anything.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter()][AllowEmptyCollection()][object[]]$Record,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Format,
+        [Parameter(Mandatory)][hashtable]$Meta
+    )
+
+    $parent = Split-Path -Parent $Path
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+
+    switch ($Format) {
+        'CSV' {
+            @($Record) | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8
+        }
+        'JSON' {
+            [pscustomobject]@{
+                schema        = $Meta.Schema
+                schemaVersion = $Meta.SchemaVersion
+                product       = $Meta.Product
+                vcfVersion    = $Meta.VcfVersion
+                exportedOn    = (Get-Date).ToUniversalTime().ToString('o')
+                sourceServer  = $Meta.Server
+                recordCount   = @($Record).Count
+                data          = @($Record)
+            } | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $Path -Encoding UTF8
+        }
+        'HTML' {
+            $style = '<style>body{font-family:Segoe UI,Arial,sans-serif;margin:24px}' +
+                     'h2{margin-bottom:2px}p.meta{color:#666;margin-top:0;font-size:12px}' +
+                     'table{border-collapse:collapse;font-size:13px}' +
+                     'th,td{border:1px solid #ccc;padding:4px 8px}th{background:#eee;text-align:left}</style>'
+            $header = '<h2>' + $Meta.Schema + '</h2><p class="meta">Source: ' + $Meta.Server +
+                      ' | VCF ' + $Meta.VcfVersion + ' | Exported: ' +
+                      (Get-Date).ToString('u') + ' | Records: ' + @($Record).Count + '</p>'
+            @($Record) | ConvertTo-Html -Head $style -PreContent $header |
+                Set-Content -LiteralPath $Path -Encoding UTF8
+        }
+    }
+
+    Write-Verbose ("Wrote {0} record(s) to {1}" -f @($Record).Count, $Path)
+}
+
+$exportMeta = @{
+    Schema        = 'orchestrator.scheduled-task'
+    SchemaVersion = '1.0'
+    Product       = 'vcf-operations-orchestrator'
+    VcfVersion    = '9.x'
+    Server        = $Server
+}
+
+$headers = $null
+try {
+    $restCommon = @{ ContentType = 'application/json' }
+
+    if ($PSVersionTable.PSVersion.Major -lt 6) {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    }
+
+    if ($IgnoreInvalidCertificate) {
+        if ($PSVersionTable.PSVersion.Major -ge 6) {
+            $restCommon['SkipCertificateCheck'] = $true
+        }
+        else {
+            Write-Warning 'Certificate validation is disabled for this session. Use this only in lab environments.'
+            [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+        }
+    }
+
+    $baseUri = "https://$Server"
+    $pair = '{0}:{1}' -f $Credential.UserName, $Credential.GetNetworkCredential().Password
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($pair))
+    $headers = @{ Accept = 'application/json'; Authorization = "Basic $encoded" }
+    Write-Verbose "Prepared basic authentication for $Server"
+
+    $records = @()
+
+    $response = Invoke-RestMethod @restCommon -Method Get -Uri "$baseUri/vco/api/tasks" -Headers $headers
+    $tasks = @($response.link)
+    Write-Verbose ("Orchestrator reports {0} scheduled task(s)." -f $tasks.Count)
+
+    foreach ($task in $tasks) {
+        $attributes = @{}
+        foreach ($attribute in @($task.attributes)) { $attributes[$attribute.name] = $attribute.value }
+
+        $state = $attributes['state']
+        if ($SuspendedOnly -and $state -eq 'running') { continue }
+
+        $records += [pscustomobject]@{
+            Name           = $attributes['name']
+            TaskId         = $attributes['id']
+            Workflow       = $attributes['workflowName']
+            State          = $state
+            Recurrence     = $attributes['recurrencePattern']
+            RecurrenceCycle = $attributes['recurrenceCycle']
+            StartDate      = $attributes['startDate']
+            NextRun        = $attributes['nextRun']
+            LastRunState   = $attributes['lastRunState']
+            Owner          = $attributes['user']
+        }
+    }
+
+    $records = @($records | Sort-Object State, Name)
+    Write-Verbose ("Collected {0} scheduled task record(s)." -f $records.Count)
+
+    if ($OutputPath) {
+        Out-ResultFile -Record $records -Path $OutputPath -Format $Format -Meta $exportMeta
+    }
+
+    $records
+}
+finally {
+    $headers = $null
+}
