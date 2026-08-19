@@ -190,6 +190,12 @@ try {
     if ($IgnoreInvalidCertificate) { $connectParams['IgnoreInvalidCertificate'] = $true }
     $connection = Connect-VcfSddcManagerServer @connectParams -ErrorAction Stop
     Write-Verbose "Connected to SDDC Manager $Server"
+    # Scope every call in this script to the connection opened above. Without this,
+    # PowerCLI cmdlets act on every connected server, which silently mixes inventories
+    # when more than one is connected. The hashtable is cloned first because indexing
+    # the inherited one would change the caller's session defaults too.
+    $PSDefaultParameterValues = $PSDefaultParameterValues.Clone()
+    $PSDefaultParameterValues['*:Server'] = $connection
 
     $desired = Read-ExportFile -Path $InputPath -ExpectedSchema $expectedSchema `
         -ExpectedProduct $expectedProduct -ExpectedVcfVersion $expectedVcfVersion
@@ -211,14 +217,17 @@ try {
     Write-Verbose ("Plan: {0} change(s), {1} already in the desired state." -f $actionable.Count, (@($plan).Count - $actionable.Count))
 
     if ($DiffOnly) {
-        Write-Verbose '-DiffOnly was specified. Nothing was changed.'
+        Write-Warning ("-DiffOnly was specified, so NOTHING was changed. The plan below lists " +
+            "{0} pending change(s). Re-run without -DiffOnly to apply it." -f $actionable.Count)
         return $plan
     }
 
     if ($actionable.Count -eq 0) {
-        Write-Verbose 'Everything already matches the desired state. Nothing to do.'
+        Write-Warning 'Everything already matches the desired state. Nothing to do.'
         return $plan
     }
+
+    Write-Verbose ("Applying {0} change(s)." -f $actionable.Count)
     $creates = @($actionable | Where-Object { $_.Action -eq 'Create' })
     if (@($actionable).Count -ne $creates.Count) {
         Write-Warning 'Hosts already commissioned cannot be re-commissioned in place; only new hosts will be added.'

@@ -132,10 +132,21 @@ $connection = $null
 try {
     $connection = Connect-VIServer -Server $Server -Credential $Credential -ErrorAction Stop
     Write-Verbose "Connected to vCenter Server $($connection.Name) (version $($connection.Version))"
+    if (@($DefaultVIServers).Count -gt 1) {
+        Write-Warning (("{0} vCenter connections are open in this session. PowerCLI cmdlets act on " +
+            "every connected server unless they are scoped, which silently mixes inventories. " +
+            "This script scopes its own calls to '{1}'.") -f @($DefaultVIServers).Count, $connection.Name)
+    }
+    # Scope every call in this script to the connection opened above. Without this,
+    # PowerCLI cmdlets act on every connected server, which silently mixes inventories
+    # when more than one is connected. The hashtable is cloned first because indexing
+    # the inherited one would change the caller's session defaults too.
+    $PSDefaultParameterValues = $PSDefaultParameterValues.Clone()
+    $PSDefaultParameterValues['*:Server'] = $connection
 
     $records = @()
 
-    foreach ($role in (Get-VIRole)) {
+    foreach ($role in (Get-VIRole -Server $connection)) {
         if (-not $IncludeSystemRole -and $role.IsSystem) { continue }
 
         $records += [pscustomobject]@{
@@ -151,7 +162,7 @@ try {
         }
     }
 
-    foreach ($permission in (Get-VIPermission)) {
+    foreach ($permission in (Get-VIPermission -Server $connection)) {
         if ($Principal) {
             $match = $false
             foreach ($pattern in $Principal) { if ($permission.Principal -like $pattern) { $match = $true; break } }

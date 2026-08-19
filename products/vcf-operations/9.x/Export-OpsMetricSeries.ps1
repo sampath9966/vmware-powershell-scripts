@@ -134,6 +134,12 @@ $connection = $null
 try {
     $connection = Connect-OMServer -Server $Server -Credential $Credential -ErrorAction Stop
     Write-Verbose "Connected to VCF Operations $($connection.Name)"
+    # Scope every call in this script to the connection opened above. Without this,
+    # PowerCLI cmdlets act on every connected server, which silently mixes inventories
+    # when more than one is connected. The hashtable is cloned first because indexing
+    # the inherited one would change the caller's session defaults too.
+    $PSDefaultParameterValues = $PSDefaultParameterValues.Clone()
+    $PSDefaultParameterValues['*:Server'] = $connection
 
     $records = @()
 

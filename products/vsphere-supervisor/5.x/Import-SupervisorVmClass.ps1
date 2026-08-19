@@ -173,15 +173,26 @@ $connection = $null
 try {
     $connection = Connect-VIServer -Server $Server -Credential $Credential -ErrorAction Stop
     $cisConnection = Connect-CisServer -Server $Server -Credential $Credential -ErrorAction Stop
+    if (@($DefaultVIServers).Count -gt 1) {
+        Write-Warning (("{0} vCenter connections are open in this session. PowerCLI cmdlets act on " +
+            "every connected server unless they are scoped, which silently mixes inventories. " +
+            "This script scopes its own calls to '{1}'.") -f @($DefaultVIServers).Count, $connection.Name)
+    }
     Write-Verbose "Connected to vCenter Server $($connection.Name) and its Automation API endpoint"
+    # Scope every call in this script to the connection opened above. Without this,
+    # PowerCLI cmdlets act on every connected server, which silently mixes inventories
+    # when more than one is connected. The hashtable is cloned first because indexing
+    # the inherited one would change the caller's session defaults too.
+    $PSDefaultParameterValues = $PSDefaultParameterValues.Clone()
+    $PSDefaultParameterValues['*:Server'] = $connection
 
     $desired = Read-ExportFile -Path $InputPath -ExpectedSchema $expectedSchema `
         -ExpectedProduct $expectedProduct -ExpectedVcfVersion $expectedVcfVersion
 
     if ($ClassName) { $desired = @($desired | Where-Object { $_.Name -in $ClassName }) }
 
-    $classService = Get-CisService -Name 'com.vmware.vcenter.namespace_management.virtual_machine_classes' -ErrorAction Stop
-    $namespaceService = Get-CisService -Name 'com.vmware.vcenter.namespaces.instances' -ErrorAction Stop
+    $classService = Get-CisService -Name 'com.vmware.vcenter.namespace_management.virtual_machine_classes' -Server $cisConnection -ErrorAction Stop
+    $namespaceService = Get-CisService -Name 'com.vmware.vcenter.namespaces.instances' -Server $cisConnection -ErrorAction Stop
 
     $current = foreach ($entry in @($classService.list())) {
         [pscustomobject]@{ Name = $entry.id; CpuCount = $entry.cpu_count; MemoryMB = $entry.memory_MB }
@@ -198,14 +209,17 @@ try {
     Write-Verbose ("Plan: {0} change(s), {1} already in the desired state." -f $actionable.Count, (@($plan).Count - $actionable.Count))
 
     if ($DiffOnly) {
-        Write-Verbose '-DiffOnly was specified. Nothing was changed.'
+        Write-Warning ("-DiffOnly was specified, so NOTHING was changed. The plan below lists " +
+            "{0} pending change(s). Re-run without -DiffOnly to apply it." -f $actionable.Count)
         return $plan
     }
 
     if ($actionable.Count -eq 0) {
-        Write-Verbose 'Everything already matches the desired state. Nothing to do.'
+        Write-Warning 'Everything already matches the desired state. Nothing to do.'
         return $plan
     }
+
+    Write-Verbose ("Applying {0} change(s)." -f $actionable.Count)
     foreach ($item in ($actionable | Where-Object { $_.Action -eq 'Create' })) {
         $row = $item.Desired
 

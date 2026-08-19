@@ -6,8 +6,8 @@ on:
   pull_request:
 
 jobs:
-  analyze:
-    name: Parse and analyze
+  check:
+    name: Repository checks
     runs-on: ubuntu-latest
 
     steps:
@@ -19,56 +19,8 @@ jobs:
           Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
           Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
 
-      - name: Parse every script
+      # Every rule lives in the harness, so CI and a contributor's local run can
+      # never disagree about what "passing" means.
+      - name: Run repository checks
         shell: pwsh
-        run: |
-          $failed = 0
-          Get-ChildItem ./products -Recurse -Filter *.ps1 | ForEach-Object {
-              $errors = $null
-              [System.Management.Automation.Language.Parser]::ParseFile(
-                  $_.FullName, [ref]$null, [ref]$errors) | Out-Null
-              if ($errors) {
-                  $failed++
-                  Write-Output "::error file=$($_.FullName),line=$($errors[0].Extent.StartLineNumber)::$($errors[0].Message)"
-              }
-          }
-          Write-Output "Parse failures: $failed"
-          if ($failed -gt 0) { exit 1 }
-
-      - name: Run PSScriptAnalyzer
-        shell: pwsh
-        run: |
-          $results = Invoke-ScriptAnalyzer -Path ./products -Recurse -Severity Error,Warning
-          foreach ($result in $results) {
-              Write-Output "::error file=$($result.ScriptPath),line=$($result.Line)::$($result.RuleName): $($result.Message)"
-          }
-          Write-Output "Analyzer findings: $(@($results).Count)"
-          if (@($results).Count -gt 0) { exit 1 }
-
-      - name: Check the write scripts declare ShouldProcess
-        shell: pwsh
-        run: |
-          $failed = 0
-          Get-ChildItem ./products -Recurse -Include 'Import-*.ps1','Invoke-*.ps1','Set-*.ps1' | ForEach-Object {
-              $content = Get-Content -LiteralPath $_.FullName -Raw
-              if ($content -notmatch 'SupportsShouldProcess') {
-                  $failed++
-                  Write-Output "::error file=$($_.FullName)::Write script does not declare SupportsShouldProcess"
-              }
-          }
-          Write-Output "Scripts missing ShouldProcess: $failed"
-          if ($failed -gt 0) { exit 1 }
-
-      - name: Check no script depends on another file
-        shell: pwsh
-        run: |
-          $failed = 0
-          Get-ChildItem ./products -Recurse -Filter *.ps1 | ForEach-Object {
-              $content = Get-Content -LiteralPath $_.FullName -Raw
-              if ($content -match '(?m)^\s*\.\s+["'']?\$PSScriptRoot' -or $content -match '(?m)^\s*Import-Module\s+\.') {
-                  $failed++
-                  Write-Output "::error file=$($_.FullName)::Script is not standalone - it loads another file from the repository"
-              }
-          }
-          Write-Output "Non-standalone scripts: $failed"
-          if ($failed -gt 0) { exit 1 }
+        run: ./tools/Invoke-RepositoryCheck.ps1

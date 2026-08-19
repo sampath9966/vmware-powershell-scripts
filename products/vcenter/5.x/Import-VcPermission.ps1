@@ -170,6 +170,17 @@ $connection = $null
 try {
     $connection = Connect-VIServer -Server $Server -Credential $Credential -ErrorAction Stop
     Write-Verbose "Connected to vCenter Server $($connection.Name) (version $($connection.Version))"
+    if (@($DefaultVIServers).Count -gt 1) {
+        Write-Warning (("{0} vCenter connections are open in this session. PowerCLI cmdlets act on " +
+            "every connected server unless they are scoped, which silently mixes inventories. " +
+            "This script scopes its own calls to '{1}'.") -f @($DefaultVIServers).Count, $connection.Name)
+    }
+    # Scope every call in this script to the connection opened above. Without this,
+    # PowerCLI cmdlets act on every connected server, which silently mixes inventories
+    # when more than one is connected. The hashtable is cloned first because indexing
+    # the inherited one would change the caller's session defaults too.
+    $PSDefaultParameterValues = $PSDefaultParameterValues.Clone()
+    $PSDefaultParameterValues['*:Server'] = $connection
 
     $desired = Read-ExportFile -Path $InputPath -ExpectedSchema $expectedSchema `
         -ExpectedProduct $expectedProduct -ExpectedVcfVersion $expectedVcfVersion
@@ -179,34 +190,54 @@ try {
     Write-Verbose ("Input lists {0} role(s) and {1} permission(s)." -f $desiredRoles.Count, $desiredPermissions.Count)
 
     $currentRole = @{}
-    foreach ($role in (Get-VIRole)) { $currentRole[$role.Name] = $role }
+    foreach ($role in (Get-VIRole -Server $connection)) { $currentRole[$role.Name] = $role }
 
     $currentPermission = @{}
-    foreach ($permission in (Get-VIPermission)) {
+    foreach ($permission in (Get-VIPermission -Server $connection)) {
         $currentPermission[('{0}|{1}|{2}' -f $permission.Principal, $permission.Entity.Name, $permission.Role)] = $permission
     }
+
+    $knownPrivilege = @{}
+    foreach ($privilege in (Get-VIPrivilege -Server $connection -ErrorAction SilentlyContinue)) {
+        $knownPrivilege[$privilege.Id] = $privilege
+    }
+
+    Write-Verbose ("Target exposes {0} privilege(s); it already has {1} role(s) and {2} permission(s)." -f `
+        $knownPrivilege.Count, $currentRole.Count, $currentPermission.Count)
 
     $plan = @()
 
     foreach ($row in $desiredRoles) {
+        $want = @($row.Privileges -split '\s*;\s*' | Where-Object { $_ } | Sort-Object -Unique)
+        $missing = @($want | Where-Object { -not $knownPrivilege.ContainsKey($_) })
+
+        if ($missing.Count -gt 0) {
+            Write-Warning ("Role '{0}': {1} of {2} privilege(s) in the file do not exist on this vCenter and will be omitted. First few: {3}" -f `
+                $row.Role, $missing.Count, $want.Count, ((@($missing) | Select-Object -First 6) -join ', '))
+        }
+
         $existing = $currentRole[$row.Role]
+
         if (-not $existing) {
             $plan += [pscustomobject]@{
                 Key = 'role:' + $row.Role; Action = 'Create'; ChangedProperty = 'privileges'
-                Kind = 'Role'; Role = $row.Role; Desired = $row; Current = $null
+                Kind = 'Role'; Role = $row.Role
+                WantPrivilege = $want; MissingPrivilege = $missing
+                Desired = $row; Current = $null
             }
             continue
         }
 
-        $want = @($row.Privileges -split '\s*;\s*' | Where-Object { $_ } | Sort-Object)
-        $have = @($existing.PrivilegeList | Sort-Object)
+        $have = @($existing.PrivilegeList | Sort-Object -Unique)
         $differs = (($want -join '|') -ne ($have -join '|'))
 
         $plan += [pscustomobject]@{
             Key = 'role:' + $row.Role
             Action = if ($differs -and $UpdateExistingRole) { 'Update' } else { 'Match' }
             ChangedProperty = if ($differs) { 'privileges' } else { '' }
-            Kind = 'Role'; Role = $row.Role; Desired = $row; Current = $existing
+            Kind = 'Role'; Role = $row.Role
+            WantPrivilege = $want; MissingPrivilege = $missing
+            Desired = $row; Current = $existing
         }
     }
 
@@ -227,51 +258,102 @@ try {
     Write-Verbose ("Plan: {0} change(s), {1} already in the desired state." -f $actionable.Count, (@($plan).Count - $actionable.Count))
 
     if ($DiffOnly) {
-        Write-Verbose '-DiffOnly was specified. Nothing was changed.'
+        Write-Warning ("-DiffOnly was specified, so NOTHING was changed. The plan below lists " +
+            "{0} pending change(s). Re-run without -DiffOnly to apply it." -f $actionable.Count)
         return $plan
     }
 
     if ($actionable.Count -eq 0) {
-        Write-Verbose 'Everything already matches the desired state. Nothing to do.'
+        Write-Warning 'Everything already matches the desired state. Nothing to do.'
         return $plan
     }
-    foreach ($item in ($actionable | Where-Object Kind -eq 'Role')) {
-        $privileges = @($item.Desired.Privileges -split '\s*;\s*' | Where-Object { $_ })
-        $resolved = @(Get-VIPrivilege -Id $privileges -ErrorAction SilentlyContinue)
 
-        if (@($resolved).Count -ne $privileges.Count) {
-            Write-Warning ("Role '{0}': {1} of {2} privileges resolved on this vCenter. The rest do not exist here." -f `
-                $item.Role, @($resolved).Count, $privileges.Count)
+    Write-Verbose ("Applying {0} change(s)." -f $actionable.Count)
+    foreach ($item in ($actionable | Where-Object Kind -eq 'Role')) {
+        $resolved = @($item.WantPrivilege |
+            Where-Object { $knownPrivilege.ContainsKey($_) } |
+            ForEach-Object { $knownPrivilege[$_] })
+
+        if (-not $resolved) {
+            Write-Warning ("Role '{0}': none of its {1} privilege(s) exist on this vCenter. Skipping." -f `
+                $item.Role, @($item.WantPrivilege).Count)
+            [pscustomobject]@{ Kind = 'Role'; Name = $item.Role; Privileges = 0; Omitted = @($item.WantPrivilege).Count; Status = 'SkippedNoPrivilege' }
+            continue
         }
 
         if ($item.Action -eq 'Create') {
-            if (-not $PSCmdlet.ShouldProcess("role '$($item.Role)'", 'Create')) { continue }
-            New-VIRole -Name $item.Role -Privilege $resolved -Confirm:$false | Out-Null
-            [pscustomobject]@{ Kind = 'Role'; Name = $item.Role; Status = 'Created' }
+            if (-not $PSCmdlet.ShouldProcess("role '$($item.Role)' with $(@($resolved).Count) privilege(s)", 'Create')) { continue }
+            New-VIRole -Name $item.Role -Privilege $resolved -Server $connection -Confirm:$false | Out-Null
+            [pscustomobject]@{ Kind = 'Role'; Name = $item.Role; Privileges = @($resolved).Count; Omitted = @($item.MissingPrivilege).Count; Status = 'Created' }
         }
         else {
             if (-not $PSCmdlet.ShouldProcess("role '$($item.Role)'", 'Update privilege list')) { continue }
             Set-VIRole -Role $item.Current -AddPrivilege $resolved -Confirm:$false | Out-Null
-            [pscustomobject]@{ Kind = 'Role'; Name = $item.Role; Status = 'Updated' }
+            [pscustomobject]@{ Kind = 'Role'; Name = $item.Role; Privileges = @($resolved).Count; Omitted = @($item.MissingPrivilege).Count; Status = 'Updated' }
         }
+    }
+
+    function Resolve-PermissionEntity {
+        <#
+            Finds the inventory object a permission belongs on. Networks and datastores are
+            not reachable through Get-Inventory, and a folder and a VM can share a name, so
+            the entity type recorded in the export is used to search and to disambiguate.
+        #>
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)][string]$Name,
+            [Parameter()][string]$EntityType
+        )
+
+        $candidates = @()
+
+        switch -Regex ($EntityType) {
+            'Network|Portgroup' { $candidates = @(Get-VirtualNetwork -Name $Name -Server $connection -ErrorAction SilentlyContinue) }
+            'Datastore'         { $candidates = @(Get-Datastore -Name $Name -Server $connection -ErrorAction SilentlyContinue) }
+        }
+
+        if (-not $candidates) { $candidates = @(Get-Inventory -Name $Name -Server $connection -ErrorAction SilentlyContinue) }
+        if (-not $candidates) { $candidates = @(Get-Datastore -Name $Name -Server $connection -ErrorAction SilentlyContinue) }
+        if (-not $candidates) { $candidates = @(Get-VirtualNetwork -Name $Name -Server $connection -ErrorAction SilentlyContinue) }
+
+        if ($EntityType -and @($candidates).Count -gt 1) {
+            $typed = @($candidates | Where-Object { ($_.GetType().Name -replace 'Impl$', '') -eq $EntityType })
+            if ($typed) { $candidates = $typed }
+        }
+
+        return @($candidates)
     }
 
     foreach ($item in ($actionable | Where-Object Kind -eq 'Permission')) {
         $row = $item.Desired
-        $entity = Get-Inventory -Name $row.Entity -ErrorAction SilentlyContinue
-        if (-not $entity) { $entity = Get-Datastore -Name $row.Entity -ErrorAction SilentlyContinue }
+        $candidates = Resolve-PermissionEntity -Name $row.Entity -EntityType $row.EntityType
 
-        if (-not $entity) {
-            Write-Warning "Object '$($row.Entity)' does not exist in this vCenter. Skipping its permission."
+        if (@($candidates).Count -eq 0) {
+            Write-Warning ("Object '{0}' of type '{1}' does not exist in this vCenter. Skipping its permission." -f $row.Entity, $row.EntityType)
             [pscustomobject]@{ Kind = 'Permission'; Name = $item.Key; Status = 'SkippedMissingObject' }
             continue
+        }
+
+        if (@($candidates).Count -gt 1) {
+            Write-Warning ("'{0}' matches {1} objects here and the type '{2}' does not narrow it to one. Skipping rather than granting on the wrong object." -f `
+                $row.Entity, @($candidates).Count, $row.EntityType)
+            [pscustomobject]@{ Kind = 'Permission'; Name = $item.Key; Status = 'SkippedAmbiguousObject' }
+            continue
+        }
+
+        $entity = @($candidates)[0]
+
+        $propagate = $true
+        if ($null -ne $row.Propagate -and "$($row.Propagate)" -ne '') {
+            try { $propagate = [System.Convert]::ToBoolean([string]$row.Propagate) }
+            catch { $propagate = $true }
         }
 
         if (-not $PSCmdlet.ShouldProcess("$($row.Principal) on $($row.Entity)", "Grant role $($row.Role)")) { continue }
 
         try {
             New-VIPermission -Entity $entity -Principal $row.Principal -Role $row.Role `
-                -Propagate ([bool]$row.Propagate) -Confirm:$false -ErrorAction Stop | Out-Null
+                -Propagate $propagate -Server $connection -Confirm:$false -ErrorAction Stop | Out-Null
             [pscustomobject]@{ Kind = 'Permission'; Name = $item.Key; Status = 'Granted' }
         }
         catch {
