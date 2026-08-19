@@ -173,6 +173,11 @@ $connection = $null
 try {
     $connection = Connect-VIServer -Server $Server -Credential $Credential -ErrorAction Stop
     $cisConnection = Connect-CisServer -Server $Server -Credential $Credential -ErrorAction Stop
+    if (@($DefaultVIServers).Count -gt 1) {
+        Write-Warning (("{0} vCenter connections are open in this session. PowerCLI cmdlets act on " +
+            "every connected server unless they are scoped, which silently mixes inventories. " +
+            "This script scopes its own calls to '{1}'.") -f @($DefaultVIServers).Count, $connection.Name)
+    }
     Write-Verbose "Connected to vCenter Server $($connection.Name) and its Automation API endpoint"
 
     $desired = Read-ExportFile -Path $InputPath -ExpectedSchema $expectedSchema `

@@ -128,6 +128,11 @@ $connection = $null
 try {
     $connection = Connect-VIServer -Server $Server -Credential $Credential -ErrorAction Stop
     Write-Verbose "Connected to vCenter Server $($connection.Name) (version $($connection.Version))"
+    if (@($DefaultVIServers).Count -gt 1) {
+        Write-Warning (("{0} vCenter connections are open in this session. PowerCLI cmdlets act on " +
+            "every connected server unless they are scoped, which silently mixes inventories. " +
+            "This script scopes its own calls to '{1}'.") -f @($DefaultVIServers).Count, $connection.Name)
+    }
 
     if (-not $SyslogHost -and -not $LogDir -and -not $NetworkCoredumpServer) {
         throw 'Nothing to do. Pass at least one of -SyslogHost, -LogDir or -NetworkCoredumpServer.'
